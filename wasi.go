@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 
 	internalwasi "github.com/tetratelabs/wazero/internal/wasi"
 	internalwasm "github.com/tetratelabs/wazero/internal/wasm"
@@ -11,26 +12,13 @@ import (
 	"github.com/tetratelabs/wazero/wasm"
 )
 
-// WASIDirFS returns a file system (a wasi.FS) for the tree of files rooted at
-// the directory dir. It's similar to os.DirFS, except that it implements
-// wasi.FS instead of the fs.FS interface.
-func WASIDirFS(dir string) wasi.FS {
-	return internalwasi.DirFS(dir)
-}
-
-func WASIMemFS() wasi.FS {
-	return &internalwasi.MemFS{
-		Files: map[string][]byte{},
-	}
-}
-
 type WASIConfig struct {
-	stdin    io.Reader
-	stdout   io.Writer
-	stderr   io.Writer
-	args     []string
-	environ  map[string]string
-	preopens map[string]wasi.FS
+	stdin   io.Reader
+	stdout  io.Writer
+	stderr  io.Writer
+	args    []string
+	environ map[string]string
+	rootFS  fs.FS
 }
 
 func NewWASIConfig() *WASIConfig {
@@ -62,8 +50,15 @@ func (c *WASIConfig) WithEnviron(environ map[string]string) *WASIConfig {
 	return c
 }
 
-func (c *WASIConfig) WithPreopens(preopens map[string]wasi.FS) *WASIConfig {
-	c.preopens = preopens
+// WithFS mounts the given fs.FS as a filesystem accessible to WASI.
+//
+// Files are available in WASI under the relative path. For example, if your FS has "example", the file should be looked
+// up the same way.
+//
+// Note: This doesn't currently support writing files.
+// See https://github.com/tetratelabs/wazero/issues/390
+func (c *WASIConfig) WithFS(rootFS fs.FS) *WASIConfig {
+	c.rootFS = rootFS
 	return c
 }
 
@@ -109,11 +104,7 @@ func newConfig(c *WASIConfig) *internalwasi.Config {
 			panic(err) // better to panic vs have bother users about unlikely size > uint32
 		}
 	}
-	if len(c.preopens) > 0 {
-		for k, v := range c.preopens {
-			cfg.Preopen(k, v)
-		}
-	}
+	cfg.FS(c.rootFS)
 	return cfg
 }
 

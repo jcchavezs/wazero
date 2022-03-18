@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path"
 	"strings"
 	"time"
 
@@ -1113,14 +1114,11 @@ func (a *wasiAPI) FdAllocate(ctx wasm.Module, fd uint32, offset, len uint64) was
 func (a *wasiAPI) FdClose(ctx wasm.Module, fd uint32) wasi.Errno {
 	cfg := a.config(ctx.Context())
 
-	f, ok := cfg.opened[fd]
-	if !ok {
+	if f := cfg.opened[fd]; f == nil {
 		return wasi.ErrnoBadf
-	}
-
-	if f.file != nil {
-		f.file.Close()
-	}
+	} else if f.file != nil {
+		f.file.Close() // TODO: maybe return a failure Errno if we can't close it
+	} // else it was a stdin stdout or stderr
 
 	delete(cfg.opened, fd)
 
@@ -1133,15 +1131,11 @@ func (a *wasiAPI) FdDatasync(ctx wasm.Module, fd uint32) wasi.Errno {
 }
 
 // FdFdstatGet implements SnapshotPreview1.FdFdstatGet
-// TODO: Currently FdFdstatget implements nothing except returning fake fs_right_inheriting
 func (a *wasiAPI) FdFdstatGet(ctx wasm.Module, fd uint32, resultStat uint32) wasi.Errno {
 	cfg := a.config(ctx.Context())
 
 	if _, ok := cfg.opened[fd]; !ok {
 		return wasi.ErrnoBadf
-	}
-	if !ctx.Memory().WriteUint64Le(resultStat+16, rightFDRead|rightFDWrite) {
-		return wasi.ErrnoFault
 	}
 	return wasi.ErrnoSuccess
 }
@@ -1150,8 +1144,8 @@ func (a *wasiAPI) FdFdstatGet(ctx wasm.Module, fd uint32, resultStat uint32) was
 func (a *wasiAPI) FdPrestatGet(ctx wasm.Module, fd uint32, resultPrestat uint32) wasi.Errno {
 	cfg := a.config(ctx.Context())
 
-	entry, ok := cfg.opened[fd]
-	if !ok || entry.path == "" {
+	entry := cfg.opened[fd]
+	if entry == nil {
 		return wasi.ErrnoBadf
 	}
 
@@ -1173,6 +1167,7 @@ func (a *wasiAPI) FdFdstatSetFlags(ctx wasm.Module, fd uint32, flags uint32) was
 }
 
 // FdFdstatSetRights implements SnapshotPreview1.FdFdstatSetRights
+// Note: This will never be implemented per https://github.com/WebAssembly/WASI/issues/469#issuecomment-1045251844
 func (a *wasiAPI) FdFdstatSetRights(ctx wasm.Module, fd uint32, fsRightsBase, fsRightsInheriting uint64) wasi.Errno {
 	return wasi.ErrnoNosys // stubbed for GrainLang per #271
 }
@@ -1229,14 +1224,11 @@ func (a *wasiAPI) FdRead(ctx wasm.Module, fd, iovs, iovsCount, resultSize uint32
 
 	var reader io.Reader
 
-	switch fd {
-	case 0:
+	if fd == fdStdin {
 		reader = cfg.stdin
-	default:
-		f, ok := cfg.opened[fd]
-		if !ok || f.file == nil {
-			return wasi.ErrnoBadf
-		}
+	} else if f := cfg.opened[fd]; f == nil || f.file == nil {
+		return wasi.ErrnoBadf
+	} else {
 		reader = f.file
 	}
 
@@ -1283,24 +1275,24 @@ func (a *wasiAPI) FdRenumber(ctx wasm.Module, fd, to uint32) wasi.Errno {
 func (a *wasiAPI) FdSeek(ctx wasm.Module, fd uint32, offset uint64, whence uint32, resultNewoffset uint32) wasi.Errno {
 	cfg := a.config(ctx.Context())
 
-	f, ok := cfg.opened[fd]
-	if !ok || f.file == nil {
+	var seeker io.Seeker
+	// Check to see if the file descriptor is available
+	if f, ok := cfg.opened[fd]; !ok || f.file == nil {
 		return wasi.ErrnoBadf
-	}
-	seeker, ok := f.file.(io.Seeker)
-	if !ok {
+		// fs.FS doesn't declare io.Seeker, but implementations such as os.File implement it.
+	} else if seeker, ok = f.file.(io.Seeker); !ok {
 		return wasi.ErrnoBadf
 	}
 
 	if whence > io.SeekEnd /* exceeds the largest valid whence */ {
 		return wasi.ErrnoInval
 	}
-	newOffst, err := seeker.Seek(int64(offset), int(whence))
+	newOffset, err := seeker.Seek(int64(offset), int(whence))
 	if err != nil {
 		return wasi.ErrnoIo
 	}
 
-	if !ctx.Memory().WriteUint32Le(resultNewoffset, uint32(newOffst)) {
+	if !ctx.Memory().WriteUint32Le(resultNewoffset, uint32(newOffset)) {
 		return wasi.ErrnoFault
 	}
 
@@ -1324,16 +1316,18 @@ func (a *wasiAPI) FdWrite(ctx wasm.Module, fd, iovs, iovsCount, resultSize uint3
 	var writer io.Writer
 
 	switch fd {
-	case 1:
+	case fdStdout:
 		writer = cfg.stdout
-	case 2:
+	case fdStderr:
 		writer = cfg.stderr
 	default:
-		f, ok := cfg.opened[fd]
-		if !ok || f.file == nil {
+		// Check to see if the file descriptor is available
+		if f, ok := cfg.opened[fd]; !ok || f.file == nil {
+			return wasi.ErrnoBadf
+			// fs.FS doesn't declare io.Writer, but implementations such as os.File implement it.
+		} else if writer, ok = f.file.(io.Writer); !ok {
 			return wasi.ErrnoBadf
 		}
-		writer = f.file
 	}
 
 	var nwritten uint32
@@ -1383,47 +1377,14 @@ func (a *wasiAPI) PathLink(ctx wasm.Module, oldFd, oldFlags, oldPath, oldPathLen
 	return wasi.ErrnoNosys // stubbed for GrainLang per #271
 }
 
-const (
-	// WASI open flags
-	oflagCreate = 1 << iota
-	// TODO: oflagDir
-	oflagExclusive
-	oflagTrunc
-
-	// WASI FS rights
-	rightFDRead  = 1 << iota
-	rightFDWrite = 0x200
-)
-
-func posixOpenFlags(oFlags uint32, fsRights uint64) (pFlags int) {
-	// TODO: handle dirflags, which decides whether to follow symbolic links or not,
-	//       by O_NOFOLLOW. Note O_NOFOLLOW doesn't exist on Windows.
-	if fsRights&rightFDWrite != 0 {
-		if fsRights&rightFDRead != 0 {
-			pFlags |= os.O_RDWR
-		} else {
-			pFlags |= os.O_WRONLY
-		}
-	}
-	if oFlags&oflagCreate != 0 {
-		pFlags |= os.O_CREATE
-	}
-	if oFlags&oflagExclusive != 0 {
-		pFlags |= os.O_EXCL
-	}
-	if oFlags&oflagTrunc != 0 {
-		pFlags |= os.O_TRUNC
-	}
-	return
-}
-
 // PathOpen implements SnapshotPreview1.PathOpen
+// Note: Rights will never be implemented per https://github.com/WebAssembly/WASI/issues/469#issuecomment-1045251844
 func (a *wasiAPI) PathOpen(ctx wasm.Module, fd, dirflags, pathPtr, pathLen, oflags uint32, fsRightsBase,
 	fsRightsInheriting uint64, fdflags, resultOpenedFd uint32) (errno wasi.Errno) {
 	cfg := a.config(ctx.Context())
 
-	dir, ok := cfg.opened[fd]
-	if !ok || dir.fileSys == nil {
+	dir := cfg.opened[fd]
+	if dir == nil || dir.fs == nil {
 		return wasi.ErrnoBadf
 	}
 
@@ -1431,37 +1392,52 @@ func (a *wasiAPI) PathOpen(ctx wasm.Module, fd, dirflags, pathPtr, pathLen, ofla
 	if !ok {
 		return wasi.ErrnoFault
 	}
-	pathName := string(b)
-	f, err := dir.fileSys.OpenWASI(dirflags, pathName, oflags, fsRightsBase, fsRightsInheriting, fdflags)
-	if err != nil {
-		switch {
-		case errors.Is(err, fs.ErrNotExist):
-			return wasi.ErrnoNoent
-		case errors.Is(err, fs.ErrExist):
-			return wasi.ErrnoExist
-		default:
-			return wasi.ErrnoIo
-		}
-	}
-
-	// when ofagDir is set, the opened file must be a directory.
-	// TODO if oflags&oflagDir != 0 return wasi.ErrnoNotdir if stat != dir
 
 	newFD, err := a.randUnusedFD(cfg)
 	if err != nil {
 		return wasi.ErrnoIo
 	}
 
-	cfg.opened[newFD] = fileEntry{
-		path:    pathName,
-		fileSys: dir.fileSys,
-		file:    f,
+	// TODO: Consider dirflags and oflags. Also, allow non-read-only open based on config about the mount.
+	// Ex. allow os.O_RDONLY, os.O_WRONLY, or os.O_RDWR either by config flag or pattern on filename
+	// See #390
+	entry, errno := openFileEntry(dir.fs, path.Join(dir.path, string(b)))
+	if errno != wasi.ErrnoSuccess {
+		return errno
 	}
+	cfg.opened[newFD] = entry
 
 	if !ctx.Memory().WriteUint32Le(resultOpenedFd, newFD) {
 		return wasi.ErrnoFault
 	}
 	return wasi.ErrnoSuccess
+}
+
+func openFileEntry(rootFS fs.FS, pathName string) (*fileEntry, wasi.Errno) {
+	// Clean the path because fs.FS Open fails requires fs.ValidPath(path).
+	pathName = path.Clean(pathName)
+
+	// Root paths are relative, as there is no CWD in WASI
+	if path.IsAbs(pathName) {
+		pathName = pathName[1:]
+	}
+
+	f, err := rootFS.Open(pathName)
+	if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return nil, wasi.ErrnoNoent
+		case errors.Is(err, fs.ErrExist):
+			return nil, wasi.ErrnoExist
+		default:
+			return nil, wasi.ErrnoIo
+		}
+	}
+
+	// TODO: verify if oflags is a directory and fail with wasi.ErrnoNotdir if not
+	// See https://github.com/WebAssembly/WASI/blob/snapshot-01/phases/snapshot/docs.md#-oflags-flagsu16
+
+	return &fileEntry{path: pathName, fs: rootFS, file: f}, wasi.ErrnoSuccess
 }
 
 // PathReadlink implements SnapshotPreview1.PathReadlink
@@ -1544,10 +1520,17 @@ func (a *wasiAPI) SockShutdown(ctx wasm.Module, fd, how uint32) wasi.Errno {
 	return wasi.ErrnoNosys // stubbed for GrainLang per #271
 }
 
+const (
+	fdStdin  = 0
+	fdStdout = 1
+	fdStderr = 2
+)
+
 type fileEntry struct {
-	path    string
-	fileSys wasi.FS
-	file    wasi.File
+	path string
+	// fs is nil for fdStdin fdStdout and fdStderr
+	fs   fs.FS
+	file fs.File
 }
 
 // ConfigContextKey indicates a context.Context includes an overriding Config.
@@ -1561,7 +1544,7 @@ type Config struct {
 	stdin   io.Reader
 	stdout,
 	stderr io.Writer
-	opened map[uint32]fileEntry
+	opened map[uint32]*fileEntry
 	// timeNowUnixNano is mutable for testing
 	timeNowUnixNano func() uint64
 	randSource      func([]byte) error
@@ -1614,11 +1597,8 @@ func (c *Config) Environ(environ ...string) error {
 	return nil
 }
 
-func (c *Config) Preopen(dir string, fileSys wasi.FS) {
-	c.opened[uint32(len(c.opened))+3] = fileEntry{
-		path:    dir,
-		fileSys: fileSys,
-	}
+func (c *Config) FS(rootFS fs.FS) {
+	c.opened[uint32(len(c.opened))+3] = &fileEntry{path: "", fs: rootFS}
 }
 
 // NewConfig sets configuration defaults
@@ -1629,7 +1609,7 @@ func NewConfig() *Config {
 		stdin:   os.Stdin,
 		stdout:  os.Stdout,
 		stderr:  os.Stderr,
-		opened:  map[uint32]fileEntry{},
+		opened:  map[uint32]*fileEntry{},
 		timeNowUnixNano: func() uint64 {
 			return uint64(time.Now().UnixNano())
 		},

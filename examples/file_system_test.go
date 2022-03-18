@@ -2,66 +2,49 @@ package examples
 
 import (
 	"bytes"
+	"embed"
 	_ "embed"
-	"io"
+	"io/fs"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/tetratelabs/wazero"
-	"github.com/tetratelabs/wazero/wasi"
 )
 
-// filesystemWasm was compiled from TinyGo testdata/file_system.go
-//go:embed testdata/file_system.wasm
-var filesystemWasm []byte
+// catFS is an embedded filesystem limited to cat.go
+//go:embed testdata/cat.go
+var catFS embed.FS
 
-func writeFile(fs wasi.FS, path string, data []byte) error {
-	f, err := fs.OpenWASI(0, path, wasi.O_CREATE|wasi.O_TRUNC, wasi.R_FD_WRITE, 0, 0)
-	if err != nil {
-		return err
-	}
+// catGo is the TinyGo source
+//go:embed testdata/cat.go
+var catGo string
 
-	if _, err := io.Copy(f, bytes.NewBuffer(data)); err != nil {
-		return err
-	}
+// catWasm was compiled from catGo
+//go:embed testdata/cat.wasm
+var catWasm []byte
 
-	return f.Close()
-}
-
-func readFile(fs wasi.FS, path string) ([]byte, error) {
-	f, err := fs.OpenWASI(0, path, 0, 0, 0, 0)
-	if err != nil {
-		return nil, err
-	}
-
-	buf := bytes.NewBuffer(nil)
-
-	if _, err := io.Copy(buf, f); err != nil {
-		return buf.Bytes(), nil
-	}
-
-	return buf.Bytes(), f.Close()
-}
-
-func Test_file_system(t *testing.T) {
+// Test_Cat writes the input file to stdout, just like `cat`.
+func Test_Cat(t *testing.T) {
 	r := wazero.NewRuntime()
+	stdoutBuf := bytes.NewBuffer(nil)
 
-	memFS := wazero.WASIMemFS()
-	err := writeFile(memFS, "input.txt", []byte("Hello, file system!"))
+	// Since wazero uses fs.FS we can use standard libraries to do things like trim the leading path.
+	rooted, err := fs.Sub(catFS, "testdata")
 	require.NoError(t, err)
 
-	wasiConfig := wazero.NewWASIConfig().WithPreopens(map[string]wasi.FS{".": memFS})
+	// Next, setup stdout so we can verify it. Then configure the filesystem to tell cat to print itself!
+	file := "cat.go"
+	wasiConfig := wazero.NewWASIConfig().WithStdout(stdoutBuf).WithFS(rooted).WithArgs(file)
 	wasi, err := r.InstantiateModule(wazero.WASISnapshotPreview1WithConfig(wasiConfig))
 	require.NoError(t, err)
 	defer wasi.Close()
 
-	// Note: TinyGo binaries must be treated as WASI Commands to initialize memory.
-	mod, err := wazero.StartWASICommandFromSource(r, filesystemWasm)
+	// Finally, start the program which executes the main function (compiled to Wasm as _start).
+	mod, err := wazero.StartWASICommandFromSource(r, catWasm)
 	require.NoError(t, err)
 	defer mod.Close()
 
-	out, err := readFile(memFS, "output.txt")
-	require.NoError(t, err)
-	require.Equal(t, "Hello, file system!", string(out))
+	// To ensure it worked, this verifies stdout from WebAssembly had what we expected.
+	require.Equal(t, catGo, stdoutBuf.String())
 }
