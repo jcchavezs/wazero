@@ -1544,6 +1544,8 @@ type Config struct {
 	stdin   io.Reader
 	stdout,
 	stderr io.Writer
+	// opened holds open file descriptors.
+	// TODO: this is unguarded, so not goroutine-safe.
 	opened map[uint32]*fileEntry
 	// timeNowUnixNano is mutable for testing
 	timeNowUnixNano func() uint64
@@ -1598,7 +1600,23 @@ func (c *Config) Environ(environ ...string) error {
 }
 
 func (c *Config) FS(rootFS fs.FS) {
-	c.opened[uint32(len(c.opened))+3] = &fileEntry{path: "", fs: rootFS}
+	if rootFS != nil {
+		c.opened[uint32(len(c.opened))+3] = &fileEntry{path: "", fs: rootFS}
+	}
+}
+
+// Close implements io.Closer
+func (c *Config) Close() (err error) {
+	// start past stdin, stdout, stderr
+	for k, v := range c.opened {
+		if v.file != nil { // File is nil for the FS root
+			if e := v.file.Close(); e != nil {
+				err = e // This means the err returned == the last non-nil error.
+			}
+		}
+		delete(c.opened, k)
+	}
+	return
 }
 
 // NewConfig sets configuration defaults

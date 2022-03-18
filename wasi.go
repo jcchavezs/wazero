@@ -70,6 +70,7 @@ func WASISnapshotPreview1() *Module {
 // WASISnapshotPreview1WithConfig are functions importable as the module name wasi.ModuleSnapshotPreview1
 func WASISnapshotPreview1WithConfig(c *WASIConfig) *Module {
 	cfg := newConfig(c) // safe copy of config
+	// TODO: make cfg close when module does
 	m, err := internalwasm.NewHostModule(wasi.ModuleSnapshotPreview1, internalwasi.SnapshotPreview1Functions(cfg))
 	if err != nil {
 		panic(fmt.Errorf("BUG: %w", err))
@@ -182,7 +183,10 @@ func StartWASICommandWithConfig(r Runtime, module *Module, config *WASIConfig) (
 	// Override the configuration if needed.
 	ctx := internal.ctx
 	if config != nil {
-		ctx = context.WithValue(ctx, internalwasi.ConfigContextKey{}, newConfig(config)) // safe copy of config
+		// If this is a scoped config, it only lives for the duration of this _start function.
+		internalConfig := newConfig(config)
+		defer internalConfig.Close()
+		ctx = context.WithValue(ctx, internalwasi.ConfigContextKey{}, internalConfig) // safe copy of config
 	}
 
 	mod, err := internal.store.Instantiate(ctx, module.module, module.name)

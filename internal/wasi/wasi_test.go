@@ -44,7 +44,44 @@ func TestConfig_Args(t *testing.T) {
 	})
 }
 
-func TestWASIAPI_Config(t *testing.T) {
+func TestConfig_Environ(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		config := NewConfig()
+		err := config.Environ("a=b", "b=cd")
+		require.NoError(t, err)
+
+		require.Equal(t, &nullTerminatedStrings{
+			nullTerminatedValues: [][]byte{
+				{'a', '=', 'b', 0},
+				{'b', '=', 'c', 'd', 0},
+			},
+			totalBufSize: 9,
+		}, config.environ)
+	})
+
+	errorTests := []struct {
+		name         string
+		environ      string
+		errorMessage string
+	}{
+		{name: "error invalid utf-8",
+			environ:      "non_utf8=\xff\xfe\xfd",
+			errorMessage: "environ[0] is not a valid UTF-8 string"},
+		{name: "error not '='-joined pair",
+			environ:      "no_equal_pair",
+			errorMessage: "environ[0] is not joined with '='"},
+	}
+	for _, tt := range errorTests {
+		tc := tt
+
+		t.Run(tc.name, func(t *testing.T) {
+			err := NewConfig().Environ(tc.environ)
+			require.EqualError(t, err, tc.errorMessage)
+		})
+	}
+}
+
+func TestConfig_ContextOverride(t *testing.T) {
 	t.Run("default when context empty", func(t *testing.T) {
 		config := NewConfig()
 		api := NewAPI(config)
@@ -63,9 +100,43 @@ func TestWASIAPI_Config(t *testing.T) {
 	})
 }
 
+func TestConfig_Close(t *testing.T) {
+	t.Run("no files", func(t *testing.T) {
+		config := NewConfig()
+
+		require.NoError(t, config.Close())
+	})
+
+	t.Run("open files", func(t *testing.T) {
+		config := NewConfig()
+
+		tmp := t.TempDir()
+		pathName := configureWriteableFile(t, tmp, config, 3, make([]byte, 0))
+		file := config.opened[3]
+		require.Equal(t, path.Base(pathName), file.path)
+
+		// Closing should delete the file descriptors after closing the files.
+		require.NoError(t, config.Close())
+		require.Empty(t, config.opened)
+
+		// Verify it was actually closed, by trying to close it again.
+		err := file.file.(*os.File).Close()
+		require.Contains(t, err.Error(), "file already closed")
+
+		// No problem closing config again because the descriptors were removed, so they won't be called again.
+		require.NoError(t, config.Close())
+	})
+
+
+	// TODO: fs but never used (ex file == nil)
+	// TODO: externally closed
+}
+
 func TestSnapshotPreview1_ArgsGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Args("a", "bc")
 	require.NoError(t, err)
 
@@ -81,6 +152,7 @@ func TestSnapshotPreview1_ArgsGet(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionArgsGet, ImportArgsGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.ArgsGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -111,9 +183,12 @@ func TestSnapshotPreview1_ArgsGet(t *testing.T) {
 func TestSnapshotPreview1_ArgsGet_Errors(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Args("a", "bc")
 	require.NoError(t, err)
 	mod, fn := instantiateModule(t, ctx, FunctionArgsGet, ImportArgsGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 	validAddress := uint32(0) // arbitrary valid address as arguments to args_get. We chose 0 here.
@@ -162,6 +237,8 @@ func TestSnapshotPreview1_ArgsGet_Errors(t *testing.T) {
 func TestSnapshotPreview1_ArgsSizesGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Args("a", "bc")
 	require.NoError(t, err)
 
@@ -176,6 +253,7 @@ func TestSnapshotPreview1_ArgsSizesGet(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionArgsSizesGet, ImportArgsSizesGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.ArgsSizesGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -206,10 +284,13 @@ func TestSnapshotPreview1_ArgsSizesGet(t *testing.T) {
 func TestSnapshotPreview1_ArgsSizesGet_Errors(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Args("a", "bc")
 	require.NoError(t, err)
 
 	mod, fn := instantiateModule(t, ctx, FunctionArgsSizesGet, ImportArgsSizesGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 	validAddress := uint32(0) // arbitrary valid address as arguments to args_sizes_get. We chose 0 here.
@@ -253,46 +334,10 @@ func TestSnapshotPreview1_ArgsSizesGet_Errors(t *testing.T) {
 	}
 }
 
-func TestConfig_Environ(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
-		config := NewConfig()
-		err := config.Environ("a=b", "b=cd")
-		require.NoError(t, err)
-
-		require.Equal(t, &nullTerminatedStrings{
-			nullTerminatedValues: [][]byte{
-				{'a', '=', 'b', 0},
-				{'b', '=', 'c', 'd', 0},
-			},
-			totalBufSize: 9,
-		}, config.environ)
-	})
-
-	errorTests := []struct {
-		name         string
-		environ      string
-		errorMessage string
-	}{
-		{name: "error invalid utf-8",
-			environ:      "non_utf8=\xff\xfe\xfd",
-			errorMessage: "environ[0] is not a valid UTF-8 string"},
-		{name: "error not '='-joined pair",
-			environ:      "no_equal_pair",
-			errorMessage: "environ[0] is not joined with '='"},
-	}
-	for _, tt := range errorTests {
-		tc := tt
-
-		t.Run(tc.name, func(t *testing.T) {
-			err := NewConfig().Environ(tc.environ)
-			require.EqualError(t, err, tc.errorMessage)
-		})
-	}
-}
-
 func TestSnapshotPreview1_EnvironGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 	err := config.Environ("a=b", "b=cd")
 	require.NoError(t, err)
 
@@ -309,6 +354,7 @@ func TestSnapshotPreview1_EnvironGet(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionEnvironGet, ImportEnvironGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.EnvironGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -339,10 +385,13 @@ func TestSnapshotPreview1_EnvironGet(t *testing.T) {
 func TestSnapshotPreview1_EnvironGet_Errors(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Environ("a=bc", "b=cd")
 	require.NoError(t, err)
 
 	mod, fn := instantiateModule(t, ctx, FunctionEnvironGet, ImportEnvironGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 	validAddress := uint32(0) // arbitrary valid address as arguments to environ_get. We chose 0 here.
@@ -391,6 +440,8 @@ func TestSnapshotPreview1_EnvironGet_Errors(t *testing.T) {
 func TestSnapshotPreview1_EnvironSizesGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Environ("a=b", "b=cd")
 	require.NoError(t, err)
 
@@ -405,6 +456,7 @@ func TestSnapshotPreview1_EnvironSizesGet(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionEnvironSizesGet, ImportEnvironSizesGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.EnvironSizesGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -435,10 +487,13 @@ func TestSnapshotPreview1_EnvironSizesGet(t *testing.T) {
 func TestSnapshotPreview1_EnvironSizesGet_Errors(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	err := config.Environ("a=b", "b=cd")
 	require.NoError(t, err)
 
 	mod, fn := instantiateModule(t, ctx, FunctionEnvironSizesGet, ImportEnvironSizesGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 	validAddress := uint32(0) // arbitrary valid address as arguments to environ_sizes_get. We chose 0 here.
@@ -486,8 +541,10 @@ func TestSnapshotPreview1_EnvironSizesGet_Errors(t *testing.T) {
 func TestSnapshotPreview1_ClockResGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionClockResGet, ImportClockResGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.ClockResGet", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).ClockResGet(mod, 0, 0))
@@ -512,9 +569,12 @@ func TestSnapshotPreview1_ClockTimeGet(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	config.timeNowUnixNano = func() uint64 { return epochNanos }
 
 	mod, fn := instantiateModule(t, ctx, FunctionClockTimeGet, ImportClockTimeGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.ClockTimeGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -547,9 +607,12 @@ func TestSnapshotPreview1_ClockTimeGet_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	config.timeNowUnixNano = func() uint64 { return epochNanos }
 
 	mod, fn := instantiateModule(t, ctx, FunctionClockTimeGet, ImportClockTimeGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 
@@ -585,8 +648,10 @@ func TestSnapshotPreview1_ClockTimeGet_Errors(t *testing.T) {
 func TestSnapshotPreview1_FdAdvise(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdAdvise, ImportFdAdvise, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdAdvise", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdAdvise(mod, 0, 0, 0, 0))
@@ -604,8 +669,10 @@ func TestSnapshotPreview1_FdAdvise(t *testing.T) {
 func TestSnapshotPreview1_FdAllocate(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdAllocate, ImportFdAllocate, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdAllocate", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdAllocate(mod, 0, 0, 0))
@@ -643,6 +710,8 @@ func TestSnapshotPreview1_FdClose(t *testing.T) {
 
 	t.Run("SnapshotPreview1.FdClose", func(t *testing.T) {
 		mod, _, api := setupFD()
+		defer mod.Close()
+		defer api.cfg.Close()
 
 		errno := api.FdClose(mod, fdToClose)
 		require.Zero(t, errno, wasi.ErrnoName(errno))
@@ -651,6 +720,8 @@ func TestSnapshotPreview1_FdClose(t *testing.T) {
 	})
 	t.Run(FunctionFdClose, func(t *testing.T) {
 		mod, fn, api := setupFD()
+		defer mod.Close()
+		defer api.cfg.Close()
 
 		ret, err := fn.Call(mod, uint64(fdToClose))
 		require.NoError(t, err)
@@ -662,6 +733,7 @@ func TestSnapshotPreview1_FdClose(t *testing.T) {
 	})
 	t.Run("ErrnoBadF for an invalid FD", func(t *testing.T) {
 		mod, _, api := setupFD()
+		defer api.cfg.Close()
 
 		errno := api.FdClose(mod, 42) // 42 is an arbitrary invalid FD
 		require.Equal(t, wasi.ErrnoBadf, errno)
@@ -672,8 +744,10 @@ func TestSnapshotPreview1_FdClose(t *testing.T) {
 func TestSnapshotPreview1_FdDatasync(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdDatasync, ImportFdDatasync, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdDatasync", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdDatasync(mod, 0))
@@ -693,8 +767,10 @@ func TestSnapshotPreview1_FdDatasync(t *testing.T) {
 func TestSnapshotPreview1_FdFdstatSetFlags(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdFdstatSetFlags, ImportFdFdstatSetFlags, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdFdstatSetFlags", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdFdstatSetFlags(mod, 0, 0))
@@ -712,8 +788,10 @@ func TestSnapshotPreview1_FdFdstatSetFlags(t *testing.T) {
 func TestSnapshotPreview1_FdFdstatSetRights(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdFdstatSetRights, ImportFdFdstatSetRights, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdFdstatSetRights", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdFdstatSetRights(mod, 0, 0, 0))
@@ -731,8 +809,10 @@ func TestSnapshotPreview1_FdFdstatSetRights(t *testing.T) {
 func TestSnapshotPreview1_FdFilestatGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdFilestatGet, ImportFdFilestatGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdFilestatGet", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdFilestatGet(mod, 0, 0))
@@ -750,8 +830,10 @@ func TestSnapshotPreview1_FdFilestatGet(t *testing.T) {
 func TestSnapshotPreview1_FdFilestatSetSize(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdFilestatSetSize, ImportFdFilestatSetSize, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdFilestatSetSize", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdFilestatSetSize(mod, 0, 0))
@@ -769,8 +851,10 @@ func TestSnapshotPreview1_FdFilestatSetSize(t *testing.T) {
 func TestSnapshotPreview1_FdFilestatSetTimes(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdFilestatSetTimes, ImportFdFilestatSetTimes, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdFilestatSetTimes", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdFilestatSetTimes(mod, 0, 0, 0, 0))
@@ -788,8 +872,10 @@ func TestSnapshotPreview1_FdFilestatSetTimes(t *testing.T) {
 func TestSnapshotPreview1_FdPread(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPread, ImportFdPread, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdPread", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdPread(mod, 0, 0, 0, 0, 0))
@@ -808,11 +894,13 @@ func TestSnapshotPreview1_FdPrestatGet(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// fd_prestat_get requires an open file descriptor. Make one.
 	pathName := configureFile(t, config, fd, make([]byte, 0))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPrestatGet, ImportFdPrestatGet, moduleName, config)
+	defer mod.Close()
 
 	resultPrestat := uint32(1) // arbitrary offset
 	expectedMemory := []byte{
@@ -855,11 +943,13 @@ func TestSnapshotPreview1_FdPrestatGet_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// fd_prestat_get requires an open file descriptor. Make one.
 	configureFile(t, config, fd, make([]byte, 0))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPrestatGet, ImportFdPrestatGet, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 
@@ -900,11 +990,13 @@ func TestSnapshotPreview1_FdPrestatDirName(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// fd_prestat_dir_name requires an open file descriptor. Make one.
 	dirName := configureFile(t, config, fd, nil)
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPrestatDirName, ImportFdPrestatDirName, moduleName, config)
+	defer mod.Close()
 
 	path := uint32(1)    // arbitrary offset
 	pathLen := uint32(3) // shorter than dirName to test the path is written for the length of pathLen
@@ -940,6 +1032,7 @@ func TestSnapshotPreview1_FdPrestatDirName_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// fd_prestat_dir_name requires an open file descriptor. Make one.
 	dirName := configureFile(t, config, fd, nil)
@@ -947,6 +1040,7 @@ func TestSnapshotPreview1_FdPrestatDirName_Errors(t *testing.T) {
 	pathLen := uint32(len(dirName))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPrestatDirName, ImportFdPrestatDirName, moduleName, config)
+	defer mod.Close()
 
 	memorySize := mod.Memory().Size()
 	validAddress := uint32(0) // Arbitrary valid address as arguments to fd_prestat_dir_name. We chose 0 here.
@@ -1004,8 +1098,10 @@ func TestSnapshotPreview1_FdPrestatDirName_Errors(t *testing.T) {
 func TestSnapshotPreview1_FdPwrite(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdPwrite, ImportFdPwrite, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdPwrite", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdPwrite(mod, 0, 0, 0, 0, 0))
@@ -1022,6 +1118,7 @@ func TestSnapshotPreview1_FdPwrite(t *testing.T) {
 func TestSnapshotPreview1_FdRead(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	fd := uint32(3)   // arbitrary fd after 0, 1, and 2, that are stdin/out/err
 	iovs := uint32(1) // arbitrary offset
@@ -1047,6 +1144,7 @@ func TestSnapshotPreview1_FdRead(t *testing.T) {
 	)
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdRead, ImportFdRead, moduleName, config)
+	defer mod.Close()
 
 	// TestSnapshotPreview1_FdRead uses a matrix because setting up test files is complicated and has to be clean each time.
 	type fdReadFn func(ctx publicwasm.Module, fd, iovs, iovsCount, resultSize uint32) wasi.Errno
@@ -1092,9 +1190,12 @@ func TestSnapshotPreview1_FdRead_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	configureFile(t, config, validFD, make([]byte, 0))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdRead, ImportFdRead, moduleName, config)
+	defer mod.Close()
 
 	tests := []struct {
 		name                        string
@@ -1182,8 +1283,10 @@ func TestSnapshotPreview1_FdRead_Errors(t *testing.T) {
 func TestSnapshotPreview1_FdReaddir(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdReaddir, ImportFdReaddir, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdReaddir", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdReaddir(mod, 0, 0, 0, 0, 0))
@@ -1201,8 +1304,10 @@ func TestSnapshotPreview1_FdReaddir(t *testing.T) {
 func TestSnapshotPreview1_FdRenumber(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdRenumber, ImportFdRenumber, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdRenumber", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdRenumber(mod, 0, 0))
@@ -1222,11 +1327,13 @@ func TestSnapshotPreview1_FdSeek(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// Open a file with arbitrary, but non-empty contents.
 	configureFile(t, config, fd, []byte("wazero"))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdSeek, ImportFdSeek, moduleName, config)
+	defer mod.Close()
 
 	// TestSnapshotPreview1_FdSeek uses a matrix because setting up test files is complicated and has to be clean each time.
 	type fdSeekFn func(ctx publicwasm.Module, fd uint32, offset uint64, whence, resultNewOffset uint32) wasi.Errno
@@ -1325,11 +1432,14 @@ func TestSnapshotPreview1_FdSeek_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// Open a file with arbitrary, but non-empty contents.
 	configureFile(t, config, validFD, []byte("wazero"))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdSeek, ImportFdSeek, moduleName, config)
+	defer mod.Close()
+
 	memorySize := mod.Memory().Size()
 
 	tests := []struct {
@@ -1372,8 +1482,10 @@ func TestSnapshotPreview1_FdSeek_Errors(t *testing.T) {
 func TestSnapshotPreview1_FdSync(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdSync, ImportFdSync, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdSync", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdSync(mod, 0))
@@ -1391,8 +1503,10 @@ func TestSnapshotPreview1_FdSync(t *testing.T) {
 func TestSnapshotPreview1_FdTell(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdTell, ImportFdTell, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.FdTell", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).FdTell(mod, 0, 0))
@@ -1409,6 +1523,7 @@ func TestSnapshotPreview1_FdTell(t *testing.T) {
 func TestSnapshotPreview1_FdWrite(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	fd := uint32(3)   // arbitrary fd after 0, 1, and 2, that are stdin/out/err
 	iovs := uint32(1) // arbitrary offset
@@ -1433,6 +1548,7 @@ func TestSnapshotPreview1_FdWrite(t *testing.T) {
 	)
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdWrite, ImportFdWrite, moduleName, config)
+	defer mod.Close()
 
 	// TestSnapshotPreview1_FdWrite uses a matrix because setting up test files is complicated and has to be clean each time.
 	type fdWriteFn func(ctx publicwasm.Module, fd, iovs, iovsCount, resultSize uint32) wasi.Errno
@@ -1452,11 +1568,14 @@ func TestSnapshotPreview1_FdWrite(t *testing.T) {
 		}},
 	}
 
+	// setup tmpDir outside of tests, so that it isn't cleaned up too early
+	tmp := t.TempDir()
+
 	for _, tt := range tests {
 		tc := tt
 		t.Run(tc.name, func(t *testing.T) {
 			// Open a file with empty contents. Use a real file because MapFS doesn't support io.Writer.
-			pathName := configureWriteableFile(t, config, fd, make([]byte, 0))
+			pathName := configureWriteableFile(t, tmp, config, fd, make([]byte, 0))
 
 			maskMemory(t, mod, len(expectedMemory))
 			ok := mod.Memory().Write(0, initialMemory)
@@ -1483,11 +1602,13 @@ func TestSnapshotPreview1_FdWrite_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// Open a file with empty contents.
-	configureWriteableFile(t, config, validFD, make([]byte, 0))
+	configureWriteableFile(t, t.TempDir(), config, validFD, make([]byte, 0))
 
 	mod, fn := instantiateModule(t, ctx, FunctionFdWrite, ImportFdWrite, moduleName, config)
+	defer mod.Close()
 
 	// Setup valid test memory
 	iovs, iovsCount := uint64(0), uint64(1)
@@ -1558,8 +1679,10 @@ func TestSnapshotPreview1_FdWrite_Errors(t *testing.T) {
 func TestSnapshotPreview1_PathCreateDirectory(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathCreateDirectory, ImportPathCreateDirectory, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathCreateDirectory", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathCreateDirectory(mod, 0, 0, 0))
@@ -1577,8 +1700,10 @@ func TestSnapshotPreview1_PathCreateDirectory(t *testing.T) {
 func TestSnapshotPreview1_PathFilestatGet(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathFilestatGet, ImportPathFilestatGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathFilestatGet", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathFilestatGet(mod, 0, 0, 0, 0, 0))
@@ -1596,8 +1721,10 @@ func TestSnapshotPreview1_PathFilestatGet(t *testing.T) {
 func TestSnapshotPreview1_PathFilestatSetTimes(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathFilestatSetTimes, ImportPathFilestatSetTimes, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathFilestatSetTimes", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathFilestatSetTimes(mod, 0, 0, 0, 0, 0, 0, 0))
@@ -1615,8 +1742,10 @@ func TestSnapshotPreview1_PathFilestatSetTimes(t *testing.T) {
 func TestSnapshotPreview1_PathLink(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathLink, ImportPathLink, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathLink", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathLink(mod, 0, 0, 0, 0, 0, 0, 0))
@@ -1635,6 +1764,7 @@ func TestSnapshotPreview1_PathOpen(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// get an absolute filename, which we will later try to open by its relative path
 	pathName := configureFile(t, config, fd, make([]byte, 0))
@@ -1666,6 +1796,7 @@ func TestSnapshotPreview1_PathOpen(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathOpen, ImportPathOpen, moduleName, config)
+	defer mod.Close()
 
 	// rights are ignored per https://github.com/WebAssembly/WASI/issues/469#issuecomment-1045251844
 	fsRightsBase, fsRightsInheriting := uint64(1), uint64(2)
@@ -1708,6 +1839,7 @@ func TestSnapshotPreview1_PathOpen_Errors(t *testing.T) {
 
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	// get an absolute filename, which we will later try to open by its relative path
 	pathName := configureFile(t, config, validFD, make([]byte, 0))
@@ -1719,6 +1851,7 @@ func TestSnapshotPreview1_PathOpen_Errors(t *testing.T) {
 	config.opened = map[uint32]*fileEntry{validFD: entry}
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathOpen, ImportPathOpen, moduleName, config)
+	defer mod.Close()
 
 	validPath := uint64(0)                                  // arbitrary offset
 	validPathLen := uint64(len(pathName))                   // the length of the file name
@@ -1781,8 +1914,10 @@ func TestSnapshotPreview1_PathOpen_Errors(t *testing.T) {
 func TestSnapshotPreview1_PathReadlink(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathReadlink, ImportPathReadlink, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathLink", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathReadlink(mod, 0, 0, 0, 0, 0, 0))
@@ -1800,8 +1935,10 @@ func TestSnapshotPreview1_PathReadlink(t *testing.T) {
 func TestSnapshotPreview1_PathRemoveDirectory(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathRemoveDirectory, ImportPathRemoveDirectory, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathRemoveDirectory", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathRemoveDirectory(mod, 0, 0, 0))
@@ -1819,8 +1956,10 @@ func TestSnapshotPreview1_PathRemoveDirectory(t *testing.T) {
 func TestSnapshotPreview1_PathRename(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathRename, ImportPathRename, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathRename", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathRename(mod, 0, 0, 0, 0, 0, 0))
@@ -1838,8 +1977,10 @@ func TestSnapshotPreview1_PathRename(t *testing.T) {
 func TestSnapshotPreview1_PathSymlink(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathSymlink, ImportPathSymlink, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathSymlink", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathSymlink(mod, 0, 0, 0, 0, 0))
@@ -1857,8 +1998,10 @@ func TestSnapshotPreview1_PathSymlink(t *testing.T) {
 func TestSnapshotPreview1_PathUnlinkFile(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPathUnlinkFile, ImportPathUnlinkFile, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PathUnlinkFile", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PathUnlinkFile(mod, 0, 0, 0))
@@ -1876,8 +2019,10 @@ func TestSnapshotPreview1_PathUnlinkFile(t *testing.T) {
 func TestSnapshotPreview1_PollOneoff(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionPollOneoff, ImportPollOneoff, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.PollOneoff", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).PollOneoff(mod, 0, 0, 0, 0))
@@ -1894,6 +2039,7 @@ func TestSnapshotPreview1_PollOneoff(t *testing.T) {
 func TestSnapshotPreview1_ProcExit(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	tests := []struct {
 		name     string
@@ -1911,6 +2057,7 @@ func TestSnapshotPreview1_ProcExit(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionProcExit, ImportProcExit, moduleName, config)
+	defer mod.Close()
 
 	for _, tt := range tests {
 		tc := tt
@@ -1929,8 +2076,10 @@ func TestSnapshotPreview1_ProcExit(t *testing.T) {
 func TestSnapshotPreview1_ProcRaise(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionProcRaise, ImportProcRaise, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.ProcRaise", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).ProcRaise(mod, 0))
@@ -1948,8 +2097,10 @@ func TestSnapshotPreview1_ProcRaise(t *testing.T) {
 func TestSnapshotPreview1_SchedYield(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionSchedYield, ImportSchedYield, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.SchedYield", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).SchedYield(mod))
@@ -1973,8 +2124,11 @@ func TestSnapshotPreview1_RandomGet(t *testing.T) {
 	length := uint32(5) // arbitrary length,
 	offset := uint32(1) // offset,
 	seed := int64(42)   // and seed value
+
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	config.randSource = func(p []byte) error {
 		s := rand.NewSource(seed)
 		rng := rand.New(s)
@@ -1984,6 +2138,7 @@ func TestSnapshotPreview1_RandomGet(t *testing.T) {
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionRandomGet, ImportRandomGet, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.RandomGet", func(t *testing.T) {
 		maskMemory(t, mod, len(expectedMemory))
@@ -2014,10 +2169,13 @@ func TestSnapshotPreview1_RandomGet(t *testing.T) {
 func TestSnapshotPreview1_RandomGet_Errors(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	validAddress := uint32(0) // arbitrary valid address
 
 	mod, fn := instantiateModule(t, ctx, FunctionRandomGet, ImportRandomGet, moduleName, config)
+	defer mod.Close()
+
 	memorySize := mod.Memory().Size()
 
 	tests := []struct {
@@ -2052,11 +2210,14 @@ func TestSnapshotPreview1_RandomGet_Errors(t *testing.T) {
 func TestSnapshotPreview1_RandomGet_SourceError(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
+
 	config.randSource = func(p []byte) error {
 		return errors.New("random source error")
 	}
 
 	mod, fn := instantiateModule(t, ctx, FunctionRandomGet, ImportRandomGet, moduleName, config)
+	defer mod.Close()
 
 	results, err := fn.Call(mod, uint64(1), uint64(5)) // arbitrary offset and length
 	require.NoError(t, err)
@@ -2067,8 +2228,10 @@ func TestSnapshotPreview1_RandomGet_SourceError(t *testing.T) {
 func TestSnapshotPreview1_SockRecv(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionSockRecv, ImportSockRecv, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.SockRecv", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).SockRecv(mod, 0, 0, 0, 0, 0, 0))
@@ -2086,8 +2249,10 @@ func TestSnapshotPreview1_SockRecv(t *testing.T) {
 func TestSnapshotPreview1_SockSend(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionSockSend, ImportSockSend, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.SockSend", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).SockSend(mod, 0, 0, 0, 0, 0))
@@ -2105,8 +2270,10 @@ func TestSnapshotPreview1_SockSend(t *testing.T) {
 func TestSnapshotPreview1_SockShutdown(t *testing.T) {
 	ctx := context.Background()
 	config := NewConfig()
+	defer config.Close()
 
 	mod, fn := instantiateModule(t, ctx, FunctionSockShutdown, ImportSockShutdown, moduleName, config)
+	defer mod.Close()
 
 	t.Run("SnapshotPreview1.SockShutdown", func(t *testing.T) {
 		require.Equal(t, wasi.ErrnoNosys, NewAPI(config).SockShutdown(mod, 0, 0))
@@ -2176,8 +2343,7 @@ func configureFile(t *testing.T, config *Config, fd uint32, data []byte) string 
 }
 
 // configureWriteableFile uses real files when io.Writer tests are needed.
-func configureWriteableFile(t *testing.T, config *Config, fd uint32, data []byte) string {
-	tmp := t.TempDir()
+func configureWriteableFile(t *testing.T, tmp string, config *Config, fd uint32, data []byte) string {
 	pathName := "arbitrary"
 	absolutePath := path.Join(tmp, "arbitrary")
 	if data == nil {
