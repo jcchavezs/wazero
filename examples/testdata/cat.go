@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 )
 
@@ -10,7 +9,6 @@ func main() {
 	for _, file := range os.Args {
 		bytes, err := os.ReadFile(file)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "couldn't read %s: %v", file, err)
 			os.Exit(1)
 		}
 
