@@ -1231,7 +1231,11 @@ func (a *wasiAPI) FdRead(ctx wasm.Module, fd, iovs, iovsCount, resultSize uint32
 
 	switch fd {
 	case 0:
-		reader = cfg.stdin
+		if cfg.stdin != nil {
+			reader = cfg.stdin
+		} else {
+			return wasi.ErrnoBadf
+		}
 	default:
 		f, ok := cfg.opened[fd]
 		if !ok || f.file == nil {
@@ -1567,22 +1571,22 @@ type Config struct {
 	randSource      func([]byte) error
 }
 
+// Stdin the same as wazero.WASIConfig WithStdin
 func (c *Config) Stdin(reader io.Reader) {
 	c.stdin = reader
 }
 
+// Stdout the same as wazero.WASIConfig WithStdout
 func (c *Config) Stdout(writer io.Writer) {
 	c.stdout = writer
 }
 
+// Stderr the same as wazero.WASIConfig WithStderr
 func (c *Config) Stderr(writer io.Writer) {
 	c.stderr = writer
 }
 
-// Args returns an option to give a command-line arguments in SnapshotPreview1 or errs if the inputs are too large.
-//
-// Note: The only reason to set this is to control what's written by SnapshotPreview1.ArgsSizesGet and SnapshotPreview1.ArgsGet
-// Note: While similar in structure to os.Args, this controls what's visible in Wasm (ex the WASI function "_start").
+// Args is the same as wazero.WASIConfig WithArgs
 func (c *Config) Args(args ...string) error {
 	wasiStrings, err := newNullTerminatedStrings(math.MaxUint32, "arg", args...) // TODO: this is crazy high even if spec allows it
 	if err != nil {
@@ -1592,14 +1596,7 @@ func (c *Config) Args(args ...string) error {
 	return nil
 }
 
-// Environ returns an option to set environment variables in SnapshotPreview1.
-// Environ returns an error if the input contains a string not joined with `=`, or if the inputs are too large.
-//  * environ: environment variables in the same format as that of `os.Environ`, where key/value pairs are joined with `=`.
-// See os.Environ
-//
-// Note: Implicit environment variable propagation into WASI is intentionally not done.
-// Note: The only reason to set this is to control what's written by SnapshotPreview1.EnvironSizesGet and SnapshotPreview1.EnvironGet
-// Note: While similar in structure to os.Environ, this controls what's visible in Wasm (ex the WASI function "_start").
+// Environ is the same as wazero.WASIConfig WithEnviron
 func (c *Config) Environ(environ ...string) error {
 	for i, env := range environ {
 		if !strings.Contains(env, "=") {
@@ -1626,9 +1623,9 @@ func NewConfig() *Config {
 	return &Config{
 		args:    &nullTerminatedStrings{},
 		environ: &nullTerminatedStrings{},
-		stdin:   os.Stdin,
-		stdout:  os.Stdout,
-		stderr:  os.Stderr,
+		stdin:   nil,
+		stdout:  io.Discard,
+		stderr:  io.Discard,
 		opened:  map[uint32]fileEntry{},
 		timeNowUnixNano: func() uint64 {
 			return uint64(time.Now().UnixNano())

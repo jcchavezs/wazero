@@ -37,31 +37,51 @@ func NewWASIConfig() *WASIConfig {
 	return &WASIConfig{}
 }
 
+// WithStdin configures where standard input (file descriptor 0) is read. The default is to fail on reads to file
+// descriptor 0 with wasi.ErrnoBadf.
+//
+// Note: This does not default to os.Stdin as that both violates sand-boxing and prevents concurrent modules.
 func (c *WASIConfig) WithStdin(stdin io.Reader) *WASIConfig {
 	c.stdin = stdin
 	return c
 }
 
+// WithStdout configures where standard output (file descriptor 1) is written. The default is io.Discard.
+//
+// Note: This does not default to os.Stdout as that both violates sand-boxing and prevents concurrent modules.
 func (c *WASIConfig) WithStdout(stdout io.Writer) *WASIConfig {
 	c.stdout = stdout
 	return c
 }
 
+// WithStderr configures where standard error (file descriptor 2) is written. The default is io.Discard.
+//
+// Note: This does not default to os.Stderr as that both violates sand-boxing and prevents concurrent modules.
 func (c *WASIConfig) WithStderr(stderr io.Writer) *WASIConfig {
 	c.stderr = stderr
 	return c
 }
 
+// WithArgs assigns command-line arguments visible to a Module imports wasi.ModuleSnapshotPreview1.
+//
+// This does not propagate os.Args intentionally as that would violate sand-boxing. There are no default arguments.
+//
+// Note: If using StartWASICommandWithConfig, you may wish to set the first argument to the module name, as this matches
+// semantics like os.Args where args[0] is the program name.
 func (c *WASIConfig) WithArgs(args ...string) *WASIConfig {
 	c.args = args
 	return c
 }
 
+// WithEnviron assigns environment variables visible to a Module imports wasi.ModuleSnapshotPreview1.
+//
+// This does not propagate os.Environ intentionally as that would violate sand-boxing. There are no default variables.
 func (c *WASIConfig) WithEnviron(environ map[string]string) *WASIConfig {
 	c.environ = environ
 	return c
 }
 
+// WithPreopens is intentionally undocumented as it is being removed in #394
 func (c *WASIConfig) WithPreopens(preopens map[string]wasi.FS) *WASIConfig {
 	c.preopens = preopens
 	return c
